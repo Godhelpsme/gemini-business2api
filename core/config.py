@@ -3,11 +3,11 @@
 
 优先级规则：
 1. 安全配置：仅环境变量（ADMIN_KEY, SESSION_SECRET_KEY）
-2. 业务配置：YAML 配置文件 > 默认值
+2. 业务配置：数据库 > 默认值
 
 配置分类：
 - 安全配置：仅从环境变量读取，不可热更新（ADMIN_KEY, SESSION_SECRET_KEY）
-- 业务配置：仅从 YAML 读取，支持热更新（API_KEY, BASE_URL, PROXY, 重试策略等）
+- 业务配置：仅从数据库读取，支持热更新（API_KEY, BASE_URL, PROXY, 重试策略等）
 """
 
 import os
@@ -157,9 +157,9 @@ class ConfigManager:
 
         优先级规则：
         1. 安全配置（ADMIN_KEY, SESSION_SECRET_KEY）：仅从环境变量读取
-        2. 其他配置：数据库 > 默认值
+        2. 业务配置：数据库 > 默认值
         """
-        # 1. 加载 YAML 配置
+        # 1. 从数据库加载配置
         yaml_data = self._load_yaml()
 
         # 2. 加载安全配置（仅从环境变量，不允许 Web 修改）
@@ -222,32 +222,46 @@ class ConfigManager:
             register_domain=str(register_domain_raw or "").strip(),
         )
 
-        # 4. 加载其他配置（从 YAML）
-        image_generation_config = ImageGenerationConfig(
-            **yaml_data.get("image_generation", {})
-        )
+        # 4. 加载其他配置（从数据库，带容错处理）
+        try:
+            image_generation_config = ImageGenerationConfig(
+                **yaml_data.get("image_generation", {})
+            )
+        except Exception as e:
+            print(f"[WARN] 图片生成配置加载失败，使用默认值: {e}")
+            image_generation_config = ImageGenerationConfig()
 
         # 加载视频生成配置
-        video_generation_config = VideoGenerationConfig(
-            **yaml_data.get("video_generation", {})
-        )
+        try:
+            video_generation_config = VideoGenerationConfig(
+                **yaml_data.get("video_generation", {})
+            )
+        except Exception as e:
+            print(f"[WARN] 视频生成配置加载失败，使用默认值: {e}")
+            video_generation_config = VideoGenerationConfig()
 
-        # 加载重试配置，自动修正不在 1-12 小时范围内的值
-        retry_data = yaml_data.get("retry", {})
-        if "rate_limit_cooldown_seconds" in retry_data:
-            value = retry_data["rate_limit_cooldown_seconds"]
-            if value < 3600 or value > 43200:  # 不在 1-12 小时范围，默认 1 小时
-                retry_data["rate_limit_cooldown_seconds"] = 3600
+        # 加载重试配置（Pydantic 会自动验证范围）
+        try:
+            retry_config = RetryConfig(**yaml_data.get("retry", {}))
+        except Exception as e:
+            print(f"[WARN] 重试配置加载失败，使用默认值: {e}")
+            retry_config = RetryConfig()
 
-        retry_config = RetryConfig(**retry_data)
+        try:
+            public_display_config = PublicDisplayConfig(
+                **yaml_data.get("public_display", {})
+            )
+        except Exception as e:
+            print(f"[WARN] 公开展示配置加载失败，使用默认值: {e}")
+            public_display_config = PublicDisplayConfig()
 
-        public_display_config = PublicDisplayConfig(
-            **yaml_data.get("public_display", {})
-        )
-
-        session_config = SessionConfig(
-            **yaml_data.get("session", {})
-        )
+        try:
+            session_config = SessionConfig(
+                **yaml_data.get("session", {})
+            )
+        except Exception as e:
+            print(f"[WARN] Session配置加载失败，使用默认值: {e}")
+            session_config = SessionConfig()
 
         # 5. 构建完整配置
         self._config = AppConfig(
@@ -261,35 +275,90 @@ class ConfigManager:
         )
 
     def _load_yaml(self) -> dict:
-        """??????????"""
+        """从数据库加载配置（严格模式）"""
         if storage.is_database_enabled():
             try:
-                has_settings = storage.has_settings_sync()
-                if has_settings:
-                    data = storage.load_settings_sync()
-                    if isinstance(data, dict):
-                        return data
+                data = storage.load_settings_sync()
+
+                # 严格模式：数据库连接失败时抛出异常
+                if data is None:
+                    print("[ERROR] 数据库连接失败")
+                    print("[ERROR] 请检查 DATABASE_URL 配置或网络连接")
+                    raise RuntimeError("数据库连接失败，应用无法启动")
+
+                if isinstance(data, dict):
+                    return data
+
                 return {}
+            except RuntimeError:
+                # 重新抛出 RuntimeError
+                raise
             except Exception as e:
-                print(f"[WARN] ?????????: {e}")
-                return {}
-        print("[WARN] ????????????")
-        return {}
+                print(f"[ERROR] 数据库加载失败: {e}")
+                raise RuntimeError(f"数据库加载失败: {e}")
+
+        print("[ERROR] 未启用数据库")
+        raise RuntimeError("未配置 DATABASE_URL，应用无法启动")
 
     def _generate_secret(self) -> str:
         """生成随机密钥"""
         return secrets.token_urlsafe(32)
 
     def save_yaml(self, data: dict):
-        """??????????"""
+        """保存配置到数据库（先验证再保存）"""
         if not storage.is_database_enabled():
             raise RuntimeError("Database is not enabled")
+
+        # 先验证数据是否符合 Pydantic 模型要求
+        try:
+            # 构建临时配置进行验证
+            security_config = SecurityConfig(
+                admin_key=os.getenv("ADMIN_KEY", ""),
+                session_secret_key=os.getenv("SESSION_SECRET_KEY", self._generate_secret())
+            )
+
+            basic_data = data.get("basic", {})
+            basic_config = BasicConfig(**basic_data)
+
+            image_generation_config = ImageGenerationConfig(
+                **data.get("image_generation", {})
+            )
+
+            video_generation_config = VideoGenerationConfig(
+                **data.get("video_generation", {})
+            )
+
+            retry_config = RetryConfig(**data.get("retry", {}))
+
+            public_display_config = PublicDisplayConfig(
+                **data.get("public_display", {})
+            )
+
+            session_config = SessionConfig(
+                **data.get("session", {})
+            )
+
+            # 验证通过，构建完整配置
+            test_config = AppConfig(
+                security=security_config,
+                basic=basic_config,
+                image_generation=image_generation_config,
+                video_generation=video_generation_config,
+                retry=retry_config,
+                public_display=public_display_config,
+                session=session_config
+            )
+        except Exception as e:
+            # 验证失败，不保存到数据库
+            raise ValueError(f"配置验证失败: {str(e)}")
+
+        # 验证通过后才保存到数据库
         try:
             saved = storage.save_settings_sync(data)
             if saved:
                 return
         except Exception as e:
-            print(f"[WARN] ?????????: {e}")
+            print(f"[WARN] 数据库保存失败: {e}")
         raise RuntimeError("Database write failed")
 
     def reload(self):
