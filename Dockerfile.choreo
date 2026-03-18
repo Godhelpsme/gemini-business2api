@@ -1,0 +1,84 @@
+# ============================================
+# Choreo-Compatible Dockerfile
+# ============================================
+# 符合 WSO2 Choreo 部署规范的 Dockerfile
+# 参考: https://wso2.com/choreo/docs/develop-components/deploy-a-containerized-application/
+
+# Stage 1: 构建前端
+FROM node:20-slim AS frontend-builder
+WORKDIR /app/frontend
+
+# 复制 package 文件并安装依赖
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm install --silent
+
+# 复制前端源码并构建
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: 最终运行时镜像
+FROM python:3.11-slim
+
+# 设置工作目录
+WORKDIR /app
+
+# 环境变量配置
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
+    PORT=7860
+
+# 安装系统依赖（合并为单层以减少镜像大小）
+COPY requirements.txt .
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        curl \
+        tzdata \
+        chromium chromium-driver \
+        dbus dbus-x11 \
+        xvfb xauth \
+        libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+        libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+        libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
+        libcairo2 fonts-liberation fonts-noto-cjk && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    pip install --no-cache-dir -r requirements.txt && \
+    apt-get purge -y gcc && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# 创建非 root 用户（Choreo 安全要求）
+RUN groupadd -r appuser && \
+    useradd -r -g appuser -u 10014 -m -s /bin/bash appuser && \
+    mkdir -p /app/data && \
+    chown -R appuser:appuser /app
+
+# 复制后端代码
+COPY --chown=appuser:appuser main.py .
+COPY --chown=appuser:appuser core ./core
+COPY --chown=appuser:appuser util ./util
+COPY --chown=appuser:appuser scripts ./scripts
+
+# 从 builder 阶段复制构建好的静态文件
+COPY --from=frontend-builder --chown=appuser:appuser /app/static ./static
+
+# 复制启动脚本
+COPY --chown=appuser:appuser entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+# 切换到非 root 用户
+USER appuser
+
+# 声明数据卷
+VOLUME ["/app/data"]
+
+# 暴露端口（Choreo 会自动检测）
+EXPOSE 7860
+
+# 健康检查（Choreo 要求）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
+
+# 启动服务
+CMD ["./entrypoint.sh"]
