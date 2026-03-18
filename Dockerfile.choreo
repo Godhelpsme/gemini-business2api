@@ -67,8 +67,8 @@ COPY --from=frontend-builder --chown=appuser:appuser /app/static ./static
 COPY --chown=appuser:appuser entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-# 切换到非 root 用户
-USER appuser
+# 切换到非 root 用户（Choreo 要求使用数字 UID，范围 10000-20000）
+USER 10014
 
 # 声明数据卷
 VOLUME ["/app/data"]
